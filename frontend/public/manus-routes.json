@@ -1,0 +1,1 @@
+{"routes":[{"path":"/","title":"VERITY AI — Home"},{"path":"/workspace","title":"New investigation"},{"path":"/report/:reportId","title":"Verification report"},{"path":"/evidence/:reportId/:claimId","title":"Evidence explorer"},{"path":"/history","title":"Investigation history"},{"path":"/about","title":"About Verity"},{"path":"/settings","title":"Settings"}]}

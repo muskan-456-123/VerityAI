@@ -1,0 +1,10 @@
+{
+  "name": "verity-ai",
+  "private": true,
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "dev": "pnpm --dir frontend dev --host 0.0.0.0",
+    "build": "pnpm --dir frontend build",
+    "typecheck": "pnpm --dir frontend typecheck"
+  }
+}
