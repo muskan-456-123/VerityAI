@@ -24,6 +24,21 @@ class ProviderError(RuntimeError):
     pass
 
 
+def _rate_limit_message(retry_after: str | None = None) -> str:
+    wait_message = "Wait for the provider's rate-limit window to reset before retrying."
+    try:
+        seconds = float(retry_after) if retry_after else 0
+        if 0 < seconds <= 86400:
+            wait_message = f"Wait about {max(1, int(seconds + 0.5))} seconds before retrying."
+    except (TypeError, ValueError):
+        pass
+    return (
+        "Groq rejected the request with HTTP 429 (rate limit or available quota). "
+        f"{wait_message} If it persists, check the Groq Console for model limits and usage/quota. "
+        "Settings only confirms that an API key is present; it cannot confirm remaining quota."
+    )
+
+
 @lru_cache(maxsize=1)
 def _selected_model() -> str:
     configured = os.getenv("GROQ_MODEL")
@@ -49,6 +64,8 @@ def _selected_model() -> str:
                     return candidate
         raise ProviderError("No general-purpose chat model is available in the Groq catalog. Set GROQ_MODEL to a supported chat model.")
     except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            raise ProviderError(_rate_limit_message(exc.response.headers.get("retry-after"))) from exc
         raise ProviderError(f"Could not retrieve the current Groq model catalog (HTTP {exc.response.status_code}).") from exc
     except (httpx.HTTPError, ValueError) as exc:
         raise ProviderError(f"Could not retrieve the current Groq model catalog: {type(exc).__name__}.") from exc
@@ -77,7 +94,9 @@ async def groq_json(system_prompt: str, user_content: str) -> dict[str, Any]:
             raise ProviderError("Groq returned JSON in an unexpected format.")
         return parsed
     except APIStatusError as exc:
-        raise ProviderError(f"Groq returned HTTP {exc.status_code}; check model access, limits and project settings.") from exc
+        if exc.status_code == 429:
+            raise ProviderError(_rate_limit_message(exc.response.headers.get("retry-after"))) from exc
+        raise ProviderError(f"Groq returned HTTP {exc.status_code}; check model access and project settings.") from exc
     except APIConnectionError as exc:
         raise ProviderError(f"Groq request failed: {type(exc).__name__}.") from exc
     except (IndexError, json.JSONDecodeError) as exc:

@@ -42,3 +42,15 @@ def test_model_discovery_fails_closed_without_general_chat_model(monkeypatch: py
             groq_client._selected_model()
     finally:
         groq_client._selected_model.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected"),
+    [(None, "rate-limit window"), ("12", "Wait about 12 seconds")],
+)
+def test_rate_limit_message_is_actionable(retry_after: str | None, expected: str) -> None:
+    message = groq_client._rate_limit_message(retry_after)
+    assert "HTTP 429" in message
+    assert expected in message
+    assert "remaining quota" in message
+    assert "API key" not in message or "present" in message
