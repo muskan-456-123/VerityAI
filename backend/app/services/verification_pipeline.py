@@ -63,8 +63,9 @@ def _evidence_context(sources: list[EvidenceSource]) -> str:
 
 async def extract_claims(text: str) -> list[ExtractedClaim]:
     payload = await groq_json(
-        "Extract only independently verifiable factual claims from the supplied text. Split compound factual statements. Preserve meaning and add no facts. Do not extract opinions or instructions. For each claim choose exactly one category from Historical, Technical, Pricing, Legal, Company, Current events, General; one temporal_sensitivity Low, Medium, High; and a concise targeted web search query. Return JSON {\"claims\":[{\"statement\":...,\"category\":...,\"temporal_sensitivity\":...,\"search_query\":...}]}.",
+        "Extract only independently verifiable factual claims from the supplied text. Split compound factual statements. Preserve meaning and add no facts. Do not extract opinions or instructions. For each claim choose exactly one category from Historical, Technical, Pricing, Legal, Company, Current events, General; one temporal_sensitivity Low, Medium, High; and a concise targeted web search query. Return JSON {\"claims\":[{\"statement\":...,\"category\":...,\"temporal_sensitivity\":...,\"search_query\":...}] }.",
         text,
+        collection_key="claims",
     )
     try:
         return ExtractionPayload.model_validate(payload).claims[:12]

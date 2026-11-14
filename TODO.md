@@ -19,3 +19,5 @@
   **Progress:** The 50-claim, six-verdict benchmark fixture, metric scorer, Groq-only baseline runner, freshness/confidence unit tests, API integration tests and production frontend type/build check are present; 11 backend/evaluation tests pass. Full prediction-based end-to-end metrics and the measured Groq-vs-baseline comparison remain pending because they require a benchmark run against the external providers.
 
 - [x] **Groq rate-limit recovery** — When Groq returns HTTP 429, explain that the provider is rate-limiting the configured model/key, show a safe retry delay when the provider sends one, and clarify that Settings key-present status does not measure remaining quota. Do not make unbounded automatic calls; offer an explicit retry of the same submitted text and keep Settings guidance available without losing the input.
+
+- [x] **Groq structured-output normalization** — In claim extraction, normalize a valid top-level claim array to the expected `{"claims": [...]}` object before Pydantic validation; continue rejecting malformed or schema-invalid content, never mark it verified, and test the normalization without external provider calls.

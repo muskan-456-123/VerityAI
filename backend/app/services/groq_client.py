@@ -71,7 +71,34 @@ def _selected_model() -> str:
         raise ProviderError(f"Could not retrieve the current Groq model catalog: {type(exc).__name__}.") from exc
 
 
-async def groq_json(system_prompt: str, user_content: str) -> dict[str, Any]:
+def _decode_structured_json(content: str, collection_key: str | None = None) -> dict[str, Any]:
+    parsed = json.loads(content)
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            pass
+    if isinstance(parsed, list):
+        if collection_key is not None and all(isinstance(item, dict) for item in parsed):
+            return {collection_key: parsed}
+        if len(parsed) == 1 and isinstance(parsed[0], dict):
+            parsed = parsed[0]
+    if isinstance(parsed, dict):
+        return parsed
+    root_type = (
+        "null" if parsed is None else "boolean" if isinstance(parsed, bool)
+        else "array" if isinstance(parsed, list) else "string" if isinstance(parsed, str)
+        else "number" if isinstance(parsed, (int, float)) else "unknown"
+    )
+    raise ProviderError(f"Groq returned JSON {root_type}; expected an object.")
+
+
+async def groq_json(
+    system_prompt: str,
+    user_content: str,
+    *,
+    collection_key: str | None = None,
+) -> dict[str, Any]:
     key = os.getenv("GROQ_API_KEY")
     if not key:
         raise ProviderError("Groq is not configured. Add GROQ_API_KEY in project settings.")
@@ -89,10 +116,7 @@ async def groq_json(system_prompt: str, user_content: str) -> dict[str, Any]:
         content = response.choices[0].message.content
         if not isinstance(content, str):
             raise ProviderError("Groq returned a response without structured JSON content.")
-        parsed = json.loads(content)
-        if not isinstance(parsed, dict):
-            raise ProviderError("Groq returned JSON in an unexpected format.")
-        return parsed
+        return _decode_structured_json(content, collection_key)
     except APIStatusError as exc:
         if exc.status_code == 429:
             raise ProviderError(_rate_limit_message(exc.response.headers.get("retry-after"))) from exc
