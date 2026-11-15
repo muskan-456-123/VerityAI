@@ -21,3 +21,6 @@
 - [x] **Groq rate-limit recovery** — When Groq returns HTTP 429, explain that the provider is rate-limiting the configured model/key, show a safe retry delay when the provider sends one, and clarify that Settings key-present status does not measure remaining quota. Do not make unbounded automatic calls; offer an explicit retry of the same submitted text and keep Settings guidance available without losing the input.
 
 - [x] **Groq structured-output normalization** — In claim extraction, normalize a valid top-level claim array to the expected `{"claims": [...]}` object before Pydantic validation; continue rejecting malformed or schema-invalid content, never mark it verified, and test the normalization without external provider calls.
+
+- [x] **Groq rate-limit resilience** — During an investigation, batch claim assessments to reduce provider calls, serialize and retry a transient Groq 429 once only when a safe bounded Retry-After is supplied, retain an actionable error when the provider quota is exhausted, and never mark an incomplete investigation verified.
+  **Validation evidence:** 22 backend/evaluation tests pass, including one-call assessment batching and bounded Retry-After behavior; the frontend production build passes.

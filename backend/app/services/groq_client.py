@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from functools import lru_cache
@@ -24,6 +25,14 @@ class ProviderError(RuntimeError):
     pass
 
 
+class RateLimitError(ProviderError):
+    pass
+
+
+class StructuredOutputError(ProviderError):
+    pass
+
+
 def _rate_limit_message(retry_after: str | None = None) -> str:
     wait_message = "Wait for the provider's rate-limit window to reset before retrying."
     try:
@@ -37,6 +46,14 @@ def _rate_limit_message(retry_after: str | None = None) -> str:
         f"{wait_message} If it persists, check the Groq Console for model limits and usage/quota. "
         "Settings only confirms that an API key is present; it cannot confirm remaining quota."
     )
+
+
+def _retry_after_seconds(retry_after: str | None) -> float | None:
+    try:
+        seconds = float(retry_after) if retry_after else 0
+    except (TypeError, ValueError):
+        return None
+    return seconds if 0 < seconds <= 30 else None
 
 
 @lru_cache(maxsize=1)
@@ -90,7 +107,7 @@ def _decode_structured_json(content: str, collection_key: str | None = None) -> 
         else "array" if isinstance(parsed, list) else "string" if isinstance(parsed, str)
         else "number" if isinstance(parsed, (int, float)) else "unknown"
     )
-    raise ProviderError(f"Groq returned JSON {root_type}; expected an object.")
+    raise StructuredOutputError(f"Groq returned JSON {root_type}; expected an object.")
 
 
 async def groq_json(
@@ -103,25 +120,38 @@ async def groq_json(
     if not key:
         raise ProviderError("Groq is not configured. Add GROQ_API_KEY in project settings.")
     try:
-        async with AsyncGroq(api_key=key, timeout=50, max_retries=1) as client:
-            response = await client.chat.completions.create(
-                model=_selected_model(),
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-            )
+        async with AsyncGroq(api_key=key, timeout=50, max_retries=0) as client:
+            model = _selected_model()
+            for attempt in range(2):
+                try:
+                    response = await client.chat.completions.create(
+                        model=model,
+                        temperature=0.1,
+                        response_format={"type": "json_object"},
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_content},
+                        ],
+                    )
+                    break
+                except APIStatusError as exc:
+                    if exc.status_code != 429:
+                        raise
+                    retry_after = exc.response.headers.get("retry-after")
+                    delay = _retry_after_seconds(retry_after)
+                    if attempt == 0 and delay is not None:
+                        await asyncio.sleep(delay)
+                        continue
+                    raise RateLimitError(_rate_limit_message(retry_after)) from exc
         content = response.choices[0].message.content
         if not isinstance(content, str):
-            raise ProviderError("Groq returned a response without structured JSON content.")
+            raise StructuredOutputError("Groq returned a response without structured JSON content.")
         return _decode_structured_json(content, collection_key)
     except APIStatusError as exc:
         if exc.status_code == 429:
-            raise ProviderError(_rate_limit_message(exc.response.headers.get("retry-after"))) from exc
+            raise RateLimitError(_rate_limit_message(exc.response.headers.get("retry-after"))) from exc
         raise ProviderError(f"Groq returned HTTP {exc.status_code}; check model access and project settings.") from exc
     except APIConnectionError as exc:
         raise ProviderError(f"Groq request failed: {type(exc).__name__}.") from exc
     except (IndexError, json.JSONDecodeError) as exc:
-        raise ProviderError("Groq returned a response that could not be parsed as structured JSON.") from exc
+        raise StructuredOutputError("Groq returned a response that could not be parsed as structured JSON.") from exc

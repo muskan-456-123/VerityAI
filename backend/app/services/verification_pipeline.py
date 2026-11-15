@@ -11,7 +11,7 @@ from app.database import repository
 from app.models.schemas import Claim, Category, ConfidenceLevel, EvidenceSource, FreshnessAssessment, TemporalSensitivity, Verdict
 from app.services.confidence_engine import assess_confidence
 from app.services.freshness_engine import assess_freshness
-from app.services.groq_client import ProviderError, groq_json
+from app.services.groq_client import ProviderError, StructuredOutputError, groq_json
 from app.services.tavily_search import search_claim
 
 
@@ -26,7 +26,8 @@ class ExtractionPayload(BaseModel):
     claims: list[ExtractedClaim] = Field(max_length=12)
 
 
-class AssessmentPayload(BaseModel):
+class AssessmentItem(BaseModel):
+    claim_id: str = Field(min_length=1, max_length=32)
     verdict: Verdict
     explanation: str = Field(max_length=1400)
     freshness_label: str = "Unclear"
@@ -34,6 +35,10 @@ class AssessmentPayload(BaseModel):
     temporal_change_evidence: bool = False
     supporting_source_ids: list[str] = Field(default_factory=list)
     contradicting_source_ids: list[str] = Field(default_factory=list)
+
+
+class AssessmentBatchPayload(BaseModel):
+    assessments: list[AssessmentItem] = Field(min_length=1, max_length=3)
 
 
 STAGES = [
@@ -73,16 +78,7 @@ async def extract_claims(text: str) -> list[ExtractedClaim]:
         raise ProviderError(f"Groq returned claims outside the required schema: {exc.errors()[0]['msg']}") from exc
 
 
-async def assess_claim(claim: ExtractedClaim, sources: list[EvidenceSource], claim_id: str) -> Claim:
-    evidence_json = _evidence_context(sources)
-    payload = await groq_json(
-        "You are a careful factual evidence analyst. Compare the exact claim to only the supplied retrieved sources. Return JSON with verdict CURRENT, STALE, CONTRADICTED, UNSUPPORTED, CONFLICTING, or STABLE; explanation; freshness_label (Current, Possibly outdated, Not time-sensitive, or Unclear); freshness_explanation; temporal_change_evidence boolean; supporting_source_ids; contradicting_source_ids. Reference sources only by their supplied id. Never invent a source, URL, date, or fact. STALE requires evidence of a newer factual change, not merely an old source. Stable historical/timeless claims can be STABLE. Use UNSUPPORTED when evidence is insufficient. Use CONFLICTING when credible sources disagree. Be explicit about limitations.",
-        json.dumps({"claim": claim.model_dump(mode="json"), "sources": json.loads(evidence_json)}, ensure_ascii=False),
-    )
-    try:
-        assessment = AssessmentPayload.model_validate(payload)
-    except ValidationError as exc:
-        raise ProviderError(f"Groq returned an invalid evidence assessment: {exc.errors()[0]['msg']}") from exc
+def _build_claim(claim: ExtractedClaim, assessment: AssessmentItem, sources: list[EvidenceSource], claim_id: str) -> Claim:
     allowed = {source.source_id for source in sources}
     supporting_ids = [sid for sid in assessment.supporting_source_ids if sid in allowed]
     contradicting_ids = [sid for sid in assessment.contradicting_source_ids if sid in allowed]
@@ -91,8 +87,6 @@ async def assess_claim(claim: ExtractedClaim, sources: list[EvidenceSource], cla
     used_ids = set(supporting_ids + contradicting_ids)
     other = [source.model_copy(update={"classification": "context"}) for source in sources if source.source_id not in used_ids]
     confidence, rank = assess_confidence(support, oppose, sources)
-    # Unsupported/contradicted claims can still be confidently assessed as such only when the
-    # evidence set supports that verdict; the confidence function remains evidence-dependent.
     freshness = assess_freshness(assessment.verdict, claim.temporal_sensitivity, assessment.freshness_label, assessment.freshness_explanation, assessment.temporal_change_evidence)
     if not sources:
         confidence, rank = ConfidenceLevel.LOW, 0.0
@@ -111,6 +105,62 @@ async def assess_claim(claim: ExtractedClaim, sources: list[EvidenceSource], cla
         contradicting_evidence=oppose,
         evidence=support + oppose + other,
     )
+
+
+AssessmentWorkItem = tuple[ExtractedClaim, list[EvidenceSource], str]
+
+
+async def _assess_claim_batch_once(items: list[AssessmentWorkItem]) -> list[Claim]:
+    if not items:
+        return []
+    model_items = [item for item in items if item[1]]
+    assessments_by_id: dict[str, AssessmentItem] = {}
+    for claim, sources, claim_id in items:
+        if not sources:
+            assessments_by_id[claim_id] = AssessmentItem(
+                claim_id=claim_id,
+                verdict=Verdict.UNSUPPORTED,
+                explanation="No retrieved evidence was available to assess this claim.",
+                freshness_label="Unclear",
+                freshness_explanation="Freshness could not be established because no source evidence was retrieved.",
+            )
+    if model_items:
+        context = [{
+            "claim_id": claim_id,
+            "claim": claim.model_dump(mode="json"),
+            "sources": json.loads(_evidence_context(sources)),
+        } for claim, sources, claim_id in model_items]
+        payload = await groq_json(
+            "For every supplied claim, compare it only with that claim's retrieved sources. Return JSON {\"assessments\":[{\"claim_id\":...,\"verdict\":...,\"explanation\":...,\"freshness_label\":...,\"freshness_explanation\":...,\"temporal_change_evidence\":false,\"supporting_source_ids\":[],\"contradicting_source_ids\":[]}]}. Use verdict CURRENT, STALE, CONTRADICTED, UNSUPPORTED, CONFLICTING, or STABLE; freshness_label Current, Possibly outdated, Not time-sensitive, or Unclear. Copy every claim_id exactly and return exactly one assessment per claim. Reference sources only by IDs listed for that claim. Never invent facts, dates, IDs, or URLs. STALE requires evidence of a newer factual change, not merely an old source. Use UNSUPPORTED when evidence is insufficient and CONFLICTING when credible sources disagree. Be explicit about limitations.",
+            json.dumps(context, ensure_ascii=False),
+            collection_key="assessments",
+        )
+        if "assessments" not in payload and len(model_items) == 1 and "verdict" in payload:
+            payload = {"assessments": [{**payload, "claim_id": model_items[0][2]}]}
+        try:
+            validated = AssessmentBatchPayload.model_validate(payload).assessments
+        except ValidationError as exc:
+            raise StructuredOutputError(f"Groq returned an invalid evidence assessment batch: {exc.errors()[0]['msg']}") from exc
+        expected_ids = {claim_id for _, _, claim_id in model_items}
+        returned_ids = [item.claim_id for item in validated]
+        if len(returned_ids) != len(set(returned_ids)) or set(returned_ids) != expected_ids:
+            raise StructuredOutputError("Groq did not return exactly one assessment for every requested claim.")
+        assessments_by_id.update({item.claim_id: item for item in validated})
+    return [_build_claim(claim, assessments_by_id[claim_id], sources, claim_id) for claim, sources, claim_id in items]
+
+
+async def assess_claim_batch(items: list[AssessmentWorkItem]) -> list[Claim]:
+    try:
+        return await _assess_claim_batch_once(items)
+    except StructuredOutputError:
+        if len(items) <= 1:
+            raise
+        midpoint = len(items) // 2
+        return await assess_claim_batch(items[:midpoint]) + await assess_claim_batch(items[midpoint:])
+
+
+async def assess_claim(claim: ExtractedClaim, sources: list[EvidenceSource], claim_id: str) -> Claim:
+    return (await assess_claim_batch([(claim, sources, claim_id)]))[0]
 
 
 async def corrected_answer(source_text: str, claims: list[Claim]) -> str:
@@ -181,11 +231,16 @@ async def run_verification(report_id: str) -> None:
         total_sources = sum(len(items) for items in sources_by_claim.values())
         _stage(report, "collect", "complete", f"Retrieved {total_sources} source records; publication dates are shown only when supplied")
 
-        _stage(report, "evaluate", "active", "Comparing each claim against its retrieved sources")
+        _stage(report, "evaluate", "active", "Comparing evidence in small provider-call batches")
+        work_items: list[AssessmentWorkItem] = [
+            (item, sources_by_claim[f"claim-{index:02d}"], f"claim-{index:02d}")
+            for index, item in enumerate(extracted, start=1)
+        ]
         claims: list[Claim] = []
-        for index, item in enumerate(extracted, start=1):
-            claim_id = f"claim-{index:02d}"
-            claims.append(await assess_claim(item, sources_by_claim[claim_id], claim_id))
+        for start in range(0, len(work_items), 3):
+            batch = work_items[start:start + 3]
+            _stage(report, "evaluate", "active", f"Assessing {len(batch)} claims in one evidence-analysis request")
+            claims.extend(await assess_claim_batch(batch))
         report["claims"] = [claim.model_dump(mode="json") for claim in claims]
         _stage(report, "evaluate", "complete", f"Evidence assessed for {len(claims)} claims")
 

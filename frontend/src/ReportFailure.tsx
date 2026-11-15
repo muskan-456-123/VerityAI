@@ -9,6 +9,7 @@ export default function ReportFailure({ report }: { report: Report }) {
   const [retryError, setRetryError] = useState('');
   const rateLimited = /HTTP 429|rate.?limit|quota/i.test(report.error || '');
   const jsonFormatMismatch = /unexpected format|JSON (array|string|number|boolean|null)|expected an object/i.test(report.error || '');
+  const legacyJsonFailure = /Groq returned JSON in an unexpected format/i.test(report.error || '');
 
   async function retry() {
     setRetrying(true);
@@ -25,7 +26,9 @@ export default function ReportFailure({ report }: { report: Report }) {
 
   return <div className="report-error" role="alert">
     <h1>We hit a source<br/>or model error.</h1>
-    <p>{report.error || 'The verification engine could not finish the report.'}</p>
+    <p>{legacyJsonFailure
+      ? 'This saved report was stopped by an older response-format check. It contains no verified findings, and refreshing this report will keep showing its saved error.'
+      : report.error || 'The verification engine could not finish the report.'}</p>
     <p>{rateLimited
       ? 'This is a Groq rate or available-quota response. Wait for the limit window to reset, then retry. If it continues, check usage, limits and model access in the Groq Console. Settings shows whether a key is present, not its remaining quota.'
       : jsonFormatMismatch
@@ -33,7 +36,7 @@ export default function ReportFailure({ report }: { report: Report }) {
         : 'You can retry the same text or check provider configuration in Settings.'}</p>
     <div className="report-error-actions">
       <button className="button button-red" type="button" onClick={() => void retry()} disabled={retrying}>
-        {retrying ? <><LoaderCircle className="spin" size={14}/> Starting…</> : <>Retry same text <ArrowRight size={15}/></>}
+        {retrying ? <><LoaderCircle className="spin" size={14}/> Starting…</> : <>{legacyJsonFailure ? 'Run fresh investigation' : 'Retry same text'} <ArrowRight size={15}/></>}
       </button>
       <Link className="button button-dark" to="/settings">Open settings <ArrowRight size={15}/></Link>
     </div>
